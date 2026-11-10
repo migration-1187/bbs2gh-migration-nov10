@@ -1,1 +1,980 @@
+name: bbs2gh-migration
 
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "GitHub Environment holding secrets & variables for pre-check, validation and monitoring. No required reviewers."
+        required: true
+        default: 'bbs-migration'
+        type: string
+      approval_environment:
+        description: "GitHub Environment used only by the migration stage. Add required reviewers here to gate migration."
+        required: true
+        default: 'bbs-migration-approval'
+        type: string
+      max_concurrent:
+        description: "Maximum concurrent migrations (1-10; the tool supports up to 10)"
+        required: false
+        default: '10'
+        type: choice
+        options: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10']
+      verbose:
+        description: Enable verbose logging (sets VERBOSE=1 and uploads *.log artifacts if produced)
+        required: false
+        default: false
+        type: boolean
+      runner_label:
+        description: 'Runner label to run on (e.g. ubuntu-24.04, or your self-hosted runner label). For multiple labels pass a JSON array, e.g. ["self-hosted","bbs"]; for a runner group a JSON object, e.g. {"group":"migration-runners","labels":["linux"]}.'
+        required: false
+        default: ubuntu-24.04
+        type: string
+      run_pre_validation:
+        description: "Run Stage 1: pre-migration checks (open PRs)"
+        required: true
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      run_migration:
+        description: "Run Stage 2: migration"
+        required: true
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      run_post_validation:
+        description: "Run Stage 3: post-migration validation"
+        required: true
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      detect_lfs_repos:
+        description: "Detect Git LFS repos (lfs-repos.csv, or detected from repos.csv) and report them. With migrate_lfs_repos=false they are skipped and not migrated. Shows the Git LFS / large files stage."
+        required: true
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      migrate_lfs_repos:
+        description: "Migrate Git LFS repos and copy their LFS objects (turns LFS detection on)."
+        required: true
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      skip_large_file_repos:
+        description: "Skip repos with files >= large_file_threshold_mb in Migration (found by the repository scan on every run). false = attempt them (gh bbs2gh rejects files >= 400 MiB; see the migration logs)."
+        required: true
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      migrate_large_file_repos:
+        description: "Migrate large-file repos by converting large files to Git LFS (REWRITES HISTORY, SHAs change; separate approval). They are skipped by Migration either way."
+        required: true
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      lfs_max_concurrent:
+        description: "Maximum concurrent Git LFS / large-file repo migrations (1-10)"
+        required: false
+        default: '2'
+        type: choice
+        options: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10']
+      large_file_threshold_mb:
+        description: "A repo is a large-file repo if any file in its history is at least this size (MB)"
+        required: false
+        default: '400'
+        type: string
+      large_file_convert_above_mb:
+        description: "In large-file repos, convert every file above this size (MB, max 100) to Git LFS"
+        required: false
+        default: '100'
+        type: string
+
+permissions: {}
+
+env:
+  DETECT_LFS: ${{ inputs.detect_lfs_repos == 'true' || inputs.migrate_lfs_repos == 'true' }}
+  SKIP_LARGE: ${{ inputs.skip_large_file_repos == 'true' || inputs.migrate_large_file_repos == 'true' }}
+
+jobs:
+  prechecks:
+    name: Pre-check
+    permissions:
+      contents: read
+    if: ${{ inputs.run_pre_validation == 'true' }}
+    runs-on: ${{ (startsWith(inputs.runner_label, '[') || startsWith(inputs.runner_label, '{')) && fromJson(inputs.runner_label) || inputs.runner_label }}
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 50400
+    outputs:
+      open_pr_repos: ${{ steps.precheck-meta.outputs.open_pr_repos }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Ensure GitHub CLI (gh)
+        shell: bash
+        env:
+          GH_CLI_VERSION: ${{ vars.GH_CLI_VERSION }}
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            echo "gh already installed: $(gh --version | head -n 1)"
+            exit 0
+          fi
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64|Linux-amd64) platform=linux_amd64 ;;
+            Linux-aarch64|Linux-arm64) platform=linux_arm64 ;;
+            *) echo "::error::gh is not installed and $(uname -s)/$(uname -m) is not supported by this step. Install the GitHub CLI on the runner: https://cli.github.com"; exit 1 ;;
+          esac
+          version="${GH_CLI_VERSION:-}"
+          version="${version#v}"
+          if [[ -z "$version" ]]; then
+            latest_url="$(curl --proto '=https' --tlsv1.2 -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/cli/cli/releases/latest)"
+            version="${latest_url##*/v}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Could not determine the gh version to install (got '${version}'). Set the GH_CLI_VERSION variable, e.g. 2.81.0, or install gh on the runner."
+            exit 1
+          fi
+          dest="$RUNNER_TEMP/gh-cli"
+          mkdir -p "$dest"
+          curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/cli/cli/releases/download/v${version}/gh_${version}_${platform}.tar.gz" | tar -xz -C "$dest"
+          echo "$dest/gh_${version}_${platform}/bin" >> "$GITHUB_PATH"
+          echo "Installed gh: $("$dest/gh_${version}_${platform}/bin/gh" --version | head -n 1)"
+
+      - name: Resolve BBS_BASE_URL (repo/environment variable)
+        shell: bash
+        env:
+          VAR_BBS_BASE_URL: ${{ vars.BBS_BASE_URL }}
+          IN_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          BBS_BASE_URL="${VAR_BBS_BASE_URL:-}"
+          if [[ -z "$BBS_BASE_URL" ]]; then
+            echo "::error::BBS_BASE_URL is not set. Set it as an Actions variable on the '${IN_ENVIRONMENT}' environment (or repo-level) under Settings → Environments/Variables."
+            exit 1
+          fi
+          echo "BBS_BASE_URL=${BBS_BASE_URL}" >> "$GITHUB_ENV"
+          echo "Resolved BBS_BASE_URL=${BBS_BASE_URL}"
+
+      - name: Install jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+
+      - name: Run prechecks (0_prechecks.sh)
+        shell: bash
+        env:
+          BBS_BASE_URL: ${{ env.BBS_BASE_URL }}
+          BBS_PAT: ${{ secrets.BBS_PAT }}
+          BBS_AUTH_TYPE: ${{ vars.BBS_AUTH_TYPE }}
+          BBS_USERNAME: ${{ vars.BBS_USERNAME }}
+          BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
+          BBS_DISABLE_SSL_VERIFY: ${{ vars.BBS_DISABLE_SSL_VERIFY }}
+          BITBUCKET_HOME: ${{ vars.BITBUCKET_HOME }}
+          RUN_LARGE_FILE_SCAN: 'false'
+        run: |
+          set -euo pipefail
+          chmod +x scripts/bash/*.sh || true
+          ./scripts/bash/0_prechecks.sh -c "$GITHUB_WORKSPACE/repos.csv"
+
+      - name: Collect prechecks output + write summary
+        id: precheck-meta
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_csv=$(ls -1t bbs_pr_validation_output-*.csv 2>/dev/null | head -n 1 || true)
+
+          if [[ -n "$out_csv" && -f "$out_csv" ]]; then
+            open_pr_repos=$(awk -F',' 'NR>1 && $5 ~ /^[0-9]+$/ && $5+0 > 0 {c++} END{print c+0}' "$out_csv")
+          else
+            open_pr_repos=0
+          fi
+
+          echo "open_pr_repos=$open_pr_repos" >> "$GITHUB_OUTPUT"
+
+          {
+            if [[ -z "$out_csv" || ! -f "$out_csv" ]]; then
+              echo "⚠️ No pre-check output CSV found."
+            else
+              total=$(awk -F',' 'NR>1 {c++} END{print c+0}' "$out_csv")
+              ready=$(awk -F',' 'NR>1 && $7=="true" {c++} END{print c+0}' "$out_csv")
+              echo "- **Total repos checked**: $total"
+              echo "- **Ready to migrate**: ✅ $ready"
+              echo "- **With open PRs**: $open_pr_repos (informational — open PRs do not block migration)"
+              echo
+              echo "**Repo Details**"
+              echo
+              echo "| Project Key | Repo | Open PRs | Ready |"
+              echo "|-|-|-|-|"
+              awk -F',' 'NR>1 {
+                mark=($7=="true" ? "✅" : "⏭️ skipped");
+                printf("| `%s` | `%s` | %s | %s |\n", $1, $3, $5, mark);
+              }' "$out_csv"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload prechecks output
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: bbs-prechecks-${{ github.run_id }}
+          path: |
+            bbs_pr_validation_output-*.csv
+          retention-days: 30
+          if-no-files-found: warn
+
+  scan:
+    name: Repository scan
+    permissions:
+      contents: read
+    runs-on: ${{ (startsWith(inputs.runner_label, '[') || startsWith(inputs.runner_label, '{')) && fromJson(inputs.runner_label) || inputs.runner_label }}
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 50400
+    outputs:
+      lfs_repos: ${{ steps.lfs.outputs.lfs_repos }}
+      large_file_repos: ${{ steps.large.outputs.large_file_repos }}
+    env:
+      BBS_PAT: ${{ secrets.BBS_PAT }}
+      BBS_AUTH_TYPE: ${{ vars.BBS_AUTH_TYPE }}
+      BBS_USERNAME: ${{ vars.BBS_USERNAME }}
+      BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
+      BBS_DISABLE_SSL_VERIFY: ${{ vars.BBS_DISABLE_SSL_VERIFY }}
+      THRESHOLD_MB: ${{ inputs.large_file_threshold_mb }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Resolve BBS_BASE_URL (repo/environment variable)
+        shell: bash
+        env:
+          VAR_BBS_BASE_URL: ${{ vars.BBS_BASE_URL }}
+          IN_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          BBS_BASE_URL="${VAR_BBS_BASE_URL:-}"
+          if [[ -z "$BBS_BASE_URL" ]]; then
+            echo "::error::BBS_BASE_URL is not set. Set it as an Actions variable on the '${IN_ENVIRONMENT}' environment (or repo-level) under Settings → Environments/Variables."
+            exit 1
+          fi
+          echo "BBS_BASE_URL=${BBS_BASE_URL}" >> "$GITHUB_ENV"
+          echo "SCAN_DIR=$RUNNER_TEMP/repo-scan" >> "$GITHUB_ENV"
+          chmod +x scripts/bash/*.sh || true
+
+      - name: Install jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+
+      - name: Repository size report and large-file repos
+        id: large
+        shell: bash
+        env:
+          IN_MIGRATE_LARGE_FILE_REPOS: ${{ inputs.migrate_large_file_repos }}
+        run: |
+          set -euo pipefail
+          count_rows() { tr -d '\r' < "$1" | awk 'NR>1 && $0 ~ /[^,"[:space:]]/ {c++} END{print c+0}'; }
+          mkdir -p "$SCAN_DIR/scan" && cd "$SCAN_DIR/scan"
+          "$GITHUB_WORKSPACE"/scripts/bash/4_large_file_migration.sh --detect --csv "$GITHUB_WORKSPACE/repos.csv" --threshold-mb "$THRESHOLD_MB"
+          sizes=$(ls -1t repo-size-report-*.csv | head -n 1)
+
+          supplied="$GITHUB_WORKSPACE/large-file-repos.csv"
+          if [[ -f "$supplied" && "$(count_rows "$supplied")" -gt 0 ]]; then
+            source="large-file-repos.csv (customer-supplied)"; reason="is listed in large-file-repos.csv"
+            mkdir -p supplied && (cd supplied && "$GITHUB_WORKSPACE"/scripts/bash/4_large_file_migration.sh --list-only --csv "$supplied")
+            rm -f large-file-repos-*.csv && mv supplied/large-file-repos-*.csv . && rmdir supplied
+          else
+            source="found by the scan (files >= ${THRESHOLD_MB} MB)"; reason="has files >= ${THRESHOLD_MB} MB"
+          fi
+          list=$(ls -1t large-file-repos-*.csv | head -n 1)
+          count=$(count_rows "$list")
+          echo "large_file_repos=$count" >> "$GITHUB_OUTPUT"
+
+          if [[ "$SKIP_LARGE" != "true" ]]; then
+            action="skip_large_file_repos=false: Migration will attempt it and gh bbs2gh will likely reject it - see the migration logs"
+            action_all="\`skip_large_file_repos=false\`: Migration attempts them and \`gh bbs2gh\` will likely reject them — see the migration logs"
+          elif [[ "${IN_MIGRATE_LARGE_FILE_REPOS}" == "true" ]]; then
+            action="Migration will skip it (Skipped - Large Files); the Large-file Migration job migrates it after approval"
+            action_all="Migration skips them (\`Skipped - Large Files\`); the **Large-file Migration** job migrates them after approval"
+          else
+            action="Migration will skip it (Skipped - Large Files) and it will not be migrated"
+            action_all="Migration skips them (\`Skipped - Large Files\`) and they are not migrated"
+          fi
+          awk -F',' 'NR>1 && $0 ~ /[^,"[:space:]]/ { for(i=1;i<=NF;i++) gsub(/"/,"",$i); print $1 "/" $3 }' "$list" | while read -r r; do
+            echo "::warning title=Large-file repository::${r} ${reason}. Remove it from repos.csv. ${action}."
+          done
+
+          {
+            echo "**🐘 Large-file repositories** (files >= ${THRESHOLD_MB} MB): $count — $source"
+            echo
+            if (( count > 0 )); then
+              echo "**Remove these repos from \`repos.csv\`.** If they stay: $action_all."
+              echo
+              echo "| Project Key | Repo | GitHub Org | GitHub Repo |"
+              echo "|-|-|-|-|"
+              awk -F',' 'NR>1 && $0 ~ /[^,"[:space:]]/ { for(i=1;i<=NF;i++) gsub(/"/,"",$i); printf("| `%s` | `%s` | `%s` | `%s` |\n", $1, $3, $4, $5) }' "$list"
+              echo
+            fi
+            report=$(ls -1t large-file-report-*.csv 2>/dev/null | head -n 1 || true)
+            if [[ -n "$report" ]]; then
+              errors=$(awk -F',' 'NR>1 && $6=="error" {n++} END{print n+0}' "$report")
+              if (( errors > 0 )); then echo "⚠️ $errors repo(s) could not be scanned — see \`$report\` in the artifact."; echo; fi
+            fi
+            echo "**📏 Repository size report** (\`$sizes\` in the \`repo-scan-${GITHUB_RUN_ID}\` artifact; \`>=\` = at least, files of ${THRESHOLD_MB} MB or more are not downloaded)"
+            echo
+            echo "| Repo | Clone MB | Commits | Branches / Tags | Files (total MB) | Largest file | > 100 MB | Largest commit MB | Warnings |"
+            echo "|-|-|-|-|-|-|-|-|-|"
+            awk -F',' 'NR>1 {
+              for(i=1;i<=NF;i++) gsub(/"/,"",$i);
+              if ($7 == "") { printf("| `%s/%s` | | | | | | | | %s |\n", $1, $2, $23); next }
+              printf("| `%s/%s` | %s | %s | %s / %s | %s (%s) | `%s` (%s MB) | %s | %s | %s |\n", $1, $2, $6, $7, $9, $10, $12, $13, $15, $14, $16, $18, ($22 == "" ? "✅" : "⚠️ " $22));
+            }' "$sizes"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Detect Git LFS repos
+        id: lfs
+        if: ${{ env.DETECT_LFS == 'true' }}
+        shell: bash
+        env:
+          IN_MIGRATE_LFS_REPOS: ${{ inputs.migrate_lfs_repos }}
+        run: |
+          set -euo pipefail
+          count_rows() { tr -d '\r' < "$1" | awk 'NR>1 && $0 ~ /[^,"[:space:]]/ {c++} END{print c+0}'; }
+          mkdir -p "$SCAN_DIR/lfs" && cd "$SCAN_DIR/lfs"
+          supplied="$GITHUB_WORKSPACE/lfs-repos.csv"
+          if [[ -f "$supplied" && "$(count_rows "$supplied")" -gt 0 ]]; then
+            source="lfs-repos.csv (customer-supplied)"
+            tr -d '\r' < "$supplied" > "lfs-repos-$(date +'%Y%m%d-%H%M%S').csv"
+          else
+            source="detected from repos.csv"
+            "$GITHUB_WORKSPACE"/scripts/bash/3_lfs_migration.sh --detect --csv "$GITHUB_WORKSPACE/repos.csv"
+          fi
+          list=$(ls -1t lfs-repos-*.csv | head -n 1)
+          count=$(count_rows "$list")
+          echo "lfs_repos=$count" >> "$GITHUB_OUTPUT"
+          if [[ "${IN_MIGRATE_LFS_REPOS}" == "true" ]]; then
+            action="migrated; the Git LFS Migration job copies its LFS objects afterwards"
+          else
+            action="Migration will skip it (Skipped - Git LFS) because migrate_lfs_repos=false"
+          fi
+          awk -F',' 'NR>1 && $0 ~ /[^,"[:space:]]/ { for(i=1;i<=NF;i++) gsub(/"/,"",$i); print $1 "/" $3 }' "$list" | while read -r r; do
+            echo "::warning title=Git LFS repository::${r} uses Git LFS: ${action}."
+          done
+          {
+            echo "**🧬 Git LFS repositories**: $count — $source"
+            echo
+            if (( count > 0 )); then
+              echo "These repos are $action."
+              echo
+              echo "| Project Key | Repo | GitHub Org | GitHub Repo |"
+              echo "|-|-|-|-|"
+              awk -F',' 'NR>1 && $0 ~ /[^,"[:space:]]/ { for(i=1;i<=NF;i++) gsub(/"/,"",$i); printf("| `%s` | `%s` | `%s` | `%s` |\n", $1, $3, $4, $5) }' "$list"
+              echo
+            fi
+            report=$(ls -1t lfs-detection-report-*.csv 2>/dev/null | head -n 1 || true)
+            if [[ -n "$report" ]]; then
+              errors=$(awk -F',' 'NR>1 && $7=="error" {n++} END{print n+0}' "$report")
+              if (( errors > 0 )); then echo "⚠️ $errors repo(s) could not be checked — see \`$report\` in the artifact."; echo; fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect scan results
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$SCAN_DIR/out"
+          cp "$SCAN_DIR"/scan/*.csv "$SCAN_DIR/out/" 2>/dev/null || true
+          cp "$SCAN_DIR"/lfs/*.csv "$SCAN_DIR/out/" 2>/dev/null || true
+          ls -1 "$SCAN_DIR/out"
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: repo-scan-${{ github.run_id }}
+          path: ${{ env.SCAN_DIR }}/out/*.csv
+          retention-days: 90
+          if-no-files-found: warn
+
+  approval:
+    name: Approve migration
+    permissions: {}
+    runs-on: ${{ (startsWith(inputs.runner_label, '[') || startsWith(inputs.runner_label, '{')) && fromJson(inputs.runner_label) || inputs.runner_label }}
+    timeout-minutes: 50400
+    needs: [prechecks, scan]
+    if: ${{ always()
+      && inputs.run_migration == 'true'
+      && needs.scan.result == 'success'
+      && (needs.prechecks.result == 'success' || (needs.prechecks.result == 'skipped' && inputs.run_pre_validation == 'false')) }}
+    environment: ${{ inputs.approval_environment }}
+    steps:
+      - name: Approved
+        shell: bash
+        run: echo "Migration approved - proceeding."
+
+  migrate:
+    name: Migration
+    permissions:
+      contents: read
+    runs-on: ${{ (startsWith(inputs.runner_label, '[') || startsWith(inputs.runner_label, '{')) && fromJson(inputs.runner_label) || inputs.runner_label }}
+    timeout-minutes: 50400
+    needs: [prechecks, approval, scan]
+    if: ${{ always()
+      && inputs.run_migration == 'true'
+      && needs.approval.result == 'success'
+      && needs.scan.result == 'success'
+      && (needs.prechecks.result == 'success' || (needs.prechecks.result == 'skipped' && inputs.run_pre_validation == 'false')) }}
+    environment: ${{ inputs.environment }}
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      VERBOSE: ${{ inputs.verbose && '1' || '0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Write migration start summary
+        shell: bash
+        run: |
+          {
+            echo "⏳ Migration is in progress — results will appear here when the job completes."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve TARGET_API_URL (variable -> default) + derive GH_HOST
+        shell: bash
+        env:
+          VAR_TARGET_API_URL: ${{ vars.TARGET_API_URL }}
+          VAR_BBS_BASE_URL: ${{ vars.BBS_BASE_URL }}
+          IN_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+
+          TARGET_API_URL="${VAR_TARGET_API_URL:-}"
+          if [[ -z "$TARGET_API_URL" ]]; then
+            TARGET_API_URL="https://api.github.com"
+          fi
+
+          host=$(echo "${TARGET_API_URL}" | sed -E 's#^https?://##; s#/.*$##')
+          GH_HOST="${host#api.}"
+
+          echo "TARGET_API_URL=${TARGET_API_URL}" >> "$GITHUB_ENV"
+          echo "GH_HOST=${GH_HOST}" >> "$GITHUB_ENV"
+
+          echo "Resolved TARGET_API_URL=${TARGET_API_URL}"
+          echo "Resolved GH_HOST=${GH_HOST}"
+
+          BBS_BASE_URL="${VAR_BBS_BASE_URL:-}"
+          if [[ -z "$BBS_BASE_URL" ]]; then
+            echo "::error::BBS_BASE_URL is not set. Set it as an Actions variable on the '${IN_ENVIRONMENT}' environment (or repo-level)."
+            exit 1
+          fi
+          echo "BBS_BASE_URL=${BBS_BASE_URL}" >> "$GITHUB_ENV"
+          echo "Resolved BBS_BASE_URL=${BBS_BASE_URL}"
+
+      - name: Check credentials are visible to this job
+        shell: bash
+        env:
+          GH_PAT_CHECK: ${{ secrets.GH_PAT }}
+          IN_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_PAT_CHECK}" ]]; then
+            echo "::error::GH_PAT is empty. Add it (and BBS_PAT/BBS_PASSWORD, and the SSH_PRIVATE_KEY secret or SSH_PRIVATE_KEY_PATH variable) to the '${IN_ENVIRONMENT}' environment, or at repo level."
+            exit 1
+          fi
+          echo "GH_PAT is present."
+
+      - name: Ensure GitHub CLI (gh)
+        shell: bash
+        env:
+          GH_CLI_VERSION: ${{ vars.GH_CLI_VERSION }}
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            echo "gh already installed: $(gh --version | head -n 1)"
+            exit 0
+          fi
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64|Linux-amd64) platform=linux_amd64 ;;
+            Linux-aarch64|Linux-arm64) platform=linux_arm64 ;;
+            *) echo "::error::gh is not installed and $(uname -s)/$(uname -m) is not supported by this step. Install the GitHub CLI on the runner: https://cli.github.com"; exit 1 ;;
+          esac
+          version="${GH_CLI_VERSION:-}"
+          version="${version#v}"
+          if [[ -z "$version" ]]; then
+            latest_url="$(curl --proto '=https' --tlsv1.2 -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/cli/cli/releases/latest)"
+            version="${latest_url##*/v}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Could not determine the gh version to install (got '${version}'). Set the GH_CLI_VERSION variable, e.g. 2.81.0, or install gh on the runner."
+            exit 1
+          fi
+          dest="$RUNNER_TEMP/gh-cli"
+          mkdir -p "$dest"
+          curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/cli/cli/releases/download/v${version}/gh_${version}_${platform}.tar.gz" | tar -xz -C "$dest"
+          echo "$dest/gh_${version}_${platform}/bin" >> "$GITHUB_PATH"
+          echo "Installed gh: $("$dest/gh_${version}_${platform}/bin/gh" --version | head -n 1)"
+
+      - name: Verify GitHub CLI auth (non-interactive)
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh --version
+          # gh auth status exits 1 if any stored account is invalid (e.g. stale hosts.yml from
+          # a previous run). Use gh api instead — it resolves credentials via GH_TOKEN env var
+          # only and is unaffected by stale config file entries.
+          gh api user --hostname "${GH_HOST}" --jq '.login' | xargs echo "Authenticated as:"
+
+      - name: Install dependencies (jq)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+
+      - name: Install gh-bbs2gh extension (DR-safe)
+        shell: bash
+        env:
+          # Installing extension from github.com using full URL; use anonymous access to avoid 401 with DR tokens.
+          GH_TOKEN: ''
+          GH_HOST: github.com
+        run: |
+          set -euo pipefail
+          if gh bbs2gh --version >/dev/null 2>&1; then
+            gh extension upgrade gh-bbs2gh || true
+          else
+            gh extension install https://github.com/github/gh-bbs2gh
+          fi
+          gh bbs2gh --version
+
+      - name: Normalize CSV header (remove spaces/CRLF/BOM)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="$GITHUB_WORKSPACE/repos.csv"
+          [[ -f "$f" ]] || { echo "::error::CSV not found: $f"; exit 1; }
+          sed -i 's/\r$//' "$f"
+          sed -i 's/, */,/g' "$f"
+          sed -i '1s/^\xEF\xBB\xBF//' "$f"
+          echo "CSV header after normalization:"
+          head -n 1 "$f"
+
+      - name: Create migration working directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bbs2gh-run"
+
+      - name: Download repository scan results
+        uses: actions/download-artifact@v8
+        with:
+          name: repo-scan-${{ github.run_id }}
+          path: ${{ runner.temp }}/bbs2gh-scan
+
+      - name: Resolve skip-lists (large-file and Git LFS repos)
+        shell: bash
+        env:
+          IN_MIGRATE_LARGE_FILE_REPOS: ${{ inputs.migrate_large_file_repos }}
+          IN_MIGRATE_LFS_REPOS: ${{ inputs.migrate_lfs_repos }}
+        run: |
+          set -euo pipefail
+          count_rows() { awk 'NR>1 && $0 ~ /[^,"[:space:]]/ {c++} END{print c+0}' "$1"; }
+          list=$(ls -1t "$RUNNER_TEMP"/bbs2gh-scan/large-file-repos-*.csv | head -n 1)
+          if [[ "$SKIP_LARGE" != "true" ]]; then
+            echo "::notice::skip_large_file_repos=false: $(count_rows "$list") large-file repo(s) will be attempted (gh bbs2gh is expected to reject them)."
+            echo "LARGE_FILE_REPOS_CSV=/dev/null" >> "$GITHUB_ENV"
+          elif [[ "${IN_MIGRATE_LARGE_FILE_REPOS}" == "true" ]]; then
+            echo "::notice::$(count_rows "$list") large-file repo(s) will be skipped here and migrated by the Large-file Migration job."
+            echo "LARGE_FILE_REPOS_CSV=$list" >> "$GITHUB_ENV"
+          else
+            echo "::notice::$(count_rows "$list") large-file repo(s) will be skipped and NOT migrated (migrate_large_file_repos=false)."
+            echo "LARGE_FILE_REPOS_CSV=$list" >> "$GITHUB_ENV"
+          fi
+
+          if [[ "$DETECT_LFS" == "true" && "${IN_MIGRATE_LFS_REPOS}" != "true" ]]; then
+            lfs_list=$(ls -1t "$RUNNER_TEMP"/bbs2gh-scan/lfs-repos-*.csv | head -n 1)
+            echo "::notice::$(count_rows "$lfs_list") Git LFS repo(s) will be skipped and NOT migrated (migrate_lfs_repos=false)."
+            echo "LFS_REPOS_CSV=$lfs_list" >> "$GITHUB_ENV"
+          fi
+
+      # Use a clean GH_CONFIG_DIR so `gh auth status` inside 1_migration.sh resolves correctly for Data Residency endpoints.
+      - name: Prepare clean gh auth for migration
+        shell: bash
+        env:
+          # blank to force stored credential creation
+          GH_TOKEN: ''
+        run: |
+          set -euo pipefail
+          export GH_CONFIG_DIR="$RUNNER_TEMP/gh-dr"
+          rm -rf "$GH_CONFIG_DIR"
+          mkdir -p "$GH_CONFIG_DIR"
+
+          echo "$GH_PAT" | gh auth login --hostname "$GH_HOST" --with-token
+          gh auth status --hostname "$GH_HOST"
+          gh auth status
+
+      - name: Run migration (1_migration.sh)
+        shell: bash
+        working-directory: ${{ runner.temp }}/bbs2gh-run
+        env:
+          # CRITICAL: don’t use env-token auth during the script; use the stored token in GH_CONFIG_DIR
+          GH_TOKEN: ''
+          BBS_BASE_URL: ${{ env.BBS_BASE_URL }}
+          BBS_USERNAME: ${{ vars.BBS_USERNAME }}
+          BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
+          BBS_DISABLE_SSL_VERIFY: ${{ vars.BBS_DISABLE_SSL_VERIFY }}
+          BITBUCKET_HOME: ${{ vars.BITBUCKET_HOME }}
+          BBS_SHARED_HOME: ${{ vars.BBS_SHARED_HOME }}
+          BBS_SSH_PORT: ${{ vars.BBS_SSH_PORT }}
+          BBS_ARCHIVE_DOWNLOAD_HOST: ${{ vars.BBS_ARCHIVE_DOWNLOAD_HOST }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PRIVATE_KEY_PATH: ${{ vars.SSH_PRIVATE_KEY_PATH }}
+          TARGET_API_URL: ${{ env.TARGET_API_URL }}
+          AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_BUCKET_NAME: ${{ secrets.AWS_BUCKET_NAME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          LARGE_FILE_REPOS_CSV: ${{ env.LARGE_FILE_REPOS_CSV }}
+          LFS_REPOS_CSV: ${{ env.LFS_REPOS_CSV }}
+          IN_MAX_CONCURRENT: ${{ inputs.max_concurrent }}
+        run: |
+          set -euo pipefail
+          export GH_CONFIG_DIR="$RUNNER_TEMP/gh-dr"
+          chmod +x "$GITHUB_WORKSPACE"/scripts/bash/*.sh || true
+
+          "$GITHUB_WORKSPACE"/scripts/bash/1_migration.sh \
+            --csv "$GITHUB_WORKSPACE/repos.csv" \
+            --max-concurrent "${IN_MAX_CONCURRENT}" \
+            --target-api-url "${TARGET_API_URL}"
+
+      - name: Upload migration logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: migration-logs-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/bbs2gh-run/migration-*.txt
+            ${{ runner.temp }}/bbs2gh-run/*.log
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload migration output CSV
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: migration-output-csv-${{ github.run_id }}
+          path: ${{ runner.temp }}/bbs2gh-run/repo_migration_output-*.csv
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Write migration step summary
+        if: always()
+        shell: bash
+        env:
+          IN_MIGRATE_LARGE_FILE_REPOS: ${{ inputs.migrate_large_file_repos }}
+          IN_MIGRATE_LFS_REPOS: ${{ inputs.migrate_lfs_repos }}
+        run: |
+          set -euo pipefail
+          out_csv=$(ls -1t "${RUNNER_TEMP}/bbs2gh-run"/repo_migration_output-*.csv 2>/dev/null | head -n 1 || true)
+
+          {
+            echo "**📦 Migration Summary**"
+            echo
+            if [[ -z "$out_csv" || ! -f "$out_csv" ]]; then
+              echo "⚠️ No migration output CSV found."
+            else
+              total=$(awk -F',' 'NR>1 {c++} END{print c+0}' "$out_csv")
+              succeeded=$(awk -F',' 'NR>1 {gsub(/"/, "", $7); if ($7=="Success") c++} END{print c+0}' "$out_csv")
+              failed=$(awk -F',' 'NR>1 {gsub(/"/, "", $7); if ($7=="Failure") c++} END{print c+0}' "$out_csv")
+              skipped=$(awk -F',' 'NR>1 {gsub(/"/, "", $7); if ($7 ~ /^Skipped/) c++} END{print c+0}' "$out_csv")
+
+              echo "- **Total repos**: $total"
+              echo "- **Migrated**: ✅ $succeeded"
+              echo "- **Failed**: $( [[ "$failed" -gt 0 ]] && echo "❌ $failed" || echo "0" )"
+              echo "- **Skipped (large files / Git LFS)**: $( [[ "$skipped" -gt 0 ]] && echo "⏭️ $skipped" || echo "0" )"
+              echo
+              echo "**Repo-wise Results**"
+              echo
+              echo "| Project Key | BBS Repo | GitHub Org | GitHub Repo | Status | Log |"
+              echo "|-|-|-|-|-|-|"
+              awk -F',' 'NR>1 {
+                for(i=1;i<=NF;i++) gsub(/"/,"",$i);
+                mark=($7=="Success"?"✅":($7 ~ /^Skipped/?"⏭️":"❌"));
+                printf("| `%s` | `%s` | `%s` | `%s` | %s %s | `%s` |\n",
+                  $1, $3, $4, $5, mark, $7, $8);
+              }' "$out_csv"
+
+              if [[ "$skipped" -gt 0 ]]; then
+                echo
+                echo "**⏭️ Skipped repos**"
+                echo
+                if [[ "${IN_MIGRATE_LARGE_FILE_REPOS}" == "true" ]]; then
+                  echo "- \`Skipped - Large Files\`: migrated by the **Large-file Migration** job after its approval."
+                else
+                  echo "- \`Skipped - Large Files\`: **not migrated** (\`migrate_large_file_repos=false\`). Remove them from \`repos.csv\`."
+                fi
+                if [[ "$DETECT_LFS" == "true" && "${IN_MIGRATE_LFS_REPOS}" != "true" ]]; then
+                  echo "- \`Skipped - Git LFS\`: **not migrated** (\`migrate_lfs_repos=false\`)."
+                fi
+                echo
+                echo "| Project Key | BBS Repo | GitHub Org | GitHub Repo | Reason |"
+                echo "|-|-|-|-|-|"
+                awk -F',' 'NR>1 {
+                  for(i=1;i<=NF;i++) gsub(/"/,"",$i);
+                  if ($7 ~ /^Skipped/) printf("| `%s` | `%s` | `%s` | `%s` | %s |\n", $1, $3, $4, $5, $7);
+                }' "$out_csv"
+              fi
+            fi
+          } > "$GITHUB_STEP_SUMMARY"
+
+
+  validate:
+    name: Post-migration Validation
+    permissions:
+      contents: read
+    runs-on: ${{ (startsWith(inputs.runner_label, '[') || startsWith(inputs.runner_label, '{')) && fromJson(inputs.runner_label) || inputs.runner_label }}
+    timeout-minutes: 50400
+    needs: [migrate]
+    environment: ${{ inputs.environment }}
+    if: ${{ always()
+      && inputs.run_post_validation == 'true'
+      && needs.migrate.result != 'cancelled'
+      && (needs.migrate.result == 'success' || (needs.migrate.result == 'skipped' && inputs.run_migration == 'false')) }}
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Write validation start summary
+        shell: bash
+        run: |
+          {
+            echo "⏳ Validation is in progress — results will appear here when the job completes."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve TARGET_API_URL (variable -> default) + derive GH_HOST
+        shell: bash
+        env:
+          VAR_TARGET_API_URL: ${{ vars.TARGET_API_URL }}
+          VAR_BBS_BASE_URL: ${{ vars.BBS_BASE_URL }}
+          IN_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          TARGET_API_URL="${VAR_TARGET_API_URL:-}"
+          if [[ -z "$TARGET_API_URL" ]]; then
+            TARGET_API_URL="https://api.github.com"
+          fi
+          host=$(echo "${TARGET_API_URL}" | sed -E 's#^https?://##; s#/.*$##')
+          GH_HOST="${host#api.}"
+          echo "TARGET_API_URL=${TARGET_API_URL}" >> "$GITHUB_ENV"
+          echo "GH_HOST=${GH_HOST}" >> "$GITHUB_ENV"
+
+          BBS_BASE_URL="${VAR_BBS_BASE_URL:-}"
+          if [[ -z "$BBS_BASE_URL" ]]; then
+            echo "::error::BBS_BASE_URL is not set. Set it as an Actions variable on the '${IN_ENVIRONMENT}' environment (or repo-level)."
+            exit 1
+          fi
+          echo "BBS_BASE_URL=${BBS_BASE_URL}" >> "$GITHUB_ENV"
+          echo "Resolved BBS_BASE_URL=${BBS_BASE_URL}"
+
+      - name: Install dependencies (jq, python3)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq python3
+          fi
+
+      - name: Create validation working directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bbs2gh-validate"
+
+      - name: Download migration output CSV
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: migration-output-csv-${{ github.run_id }}
+          path: ${{ runner.temp }}/bbs2gh-migrate-out
+
+      - name: Build filtered CSV (successful migrations only)
+        id: filter-csv
+        shell: bash
+        run: |
+          set -euo pipefail
+          filtered="${RUNNER_TEMP}/bbs2gh-validate/repos-validated.csv"
+          mapfile -t mig_csvs < <(ls -1 "${RUNNER_TEMP}/bbs2gh-migrate-out"/repo_migration_output-*.csv 2>/dev/null || true)
+
+          if [[ "${#mig_csvs[@]}" -eq 0 ]]; then
+            echo "::warning::No migration output CSV found — falling back to full repos.csv"
+            tr -d '\r' < "$GITHUB_WORKSPACE/repos.csv" | grep -v '^[[:space:]]*$' > "$filtered"
+            count=$(awk 'NR>1' "$filtered" | wc -l | tr -d ' ')
+          else
+            # Header from original repos.csv (project-key,project-name,repo,github_org,github_repo,gh_repo_visibility)
+            head -n 1 "$GITHUB_WORKSPACE/repos.csv" | tr -d '\r' > "$filtered"
+            # Keep rows where col 7 (Migration_Status) == Success, across the standard and large-file runs
+            for c in "${mig_csvs[@]}"; do
+              echo "Reading migration output: $c"
+              tr -d '\r' < "$c" | awk -F',' 'NR>1 && NF>=6 { gsub(/"/, "", $7); if ($7=="Success") print $1","$2","$3","$4","$5","$6 }'
+            done | grep -v '^[[:space:]]*$' | sort -u >> "$filtered"
+            count=$(awk 'NR>1' "$filtered" | wc -l | tr -d ' ')
+            echo "Repos to validate: $count"
+          fi
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "filtered_csv=$filtered" >> "$GITHUB_OUTPUT"
+
+      - name: Skip validation if no repos succeeded
+        if: steps.filter-csv.outputs.count == '0'
+        shell: bash
+        run: |
+          echo "::notice::No repositories migrated successfully (failed and/or skipped) — skipping validation."
+          echo "ℹ️ No repositories were successfully migrated — validation skipped." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      # Use a clean GH_CONFIG_DIR so `gh auth status` inside 2_validation.sh resolves correctly for Data Residency endpoints.
+      - name: Ensure GitHub CLI (gh)
+        shell: bash
+        env:
+          GH_CLI_VERSION: ${{ vars.GH_CLI_VERSION }}
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            echo "gh already installed: $(gh --version | head -n 1)"
+            exit 0
+          fi
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64|Linux-amd64) platform=linux_amd64 ;;
+            Linux-aarch64|Linux-arm64) platform=linux_arm64 ;;
+            *) echo "::error::gh is not installed and $(uname -s)/$(uname -m) is not supported by this step. Install the GitHub CLI on the runner: https://cli.github.com"; exit 1 ;;
+          esac
+          version="${GH_CLI_VERSION:-}"
+          version="${version#v}"
+          if [[ -z "$version" ]]; then
+            latest_url="$(curl --proto '=https' --tlsv1.2 -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/cli/cli/releases/latest)"
+            version="${latest_url##*/v}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Could not determine the gh version to install (got '${version}'). Set the GH_CLI_VERSION variable, e.g. 2.81.0, or install gh on the runner."
+            exit 1
+          fi
+          dest="$RUNNER_TEMP/gh-cli"
+          mkdir -p "$dest"
+          curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/cli/cli/releases/download/v${version}/gh_${version}_${platform}.tar.gz" | tar -xz -C "$dest"
+          echo "$dest/gh_${version}_${platform}/bin" >> "$GITHUB_PATH"
+          echo "Installed gh: $("$dest/gh_${version}_${platform}/bin/gh" --version | head -n 1)"
+
+      - name: Prepare clean gh auth for validation
+        shell: bash
+        env:
+          GH_TOKEN: ''
+        run: |
+          set -euo pipefail
+          export GH_CONFIG_DIR="$RUNNER_TEMP/gh-dr"
+          # reuse the same config dir created in migrate if present; if not, create
+          mkdir -p "$GH_CONFIG_DIR"
+          echo "$GH_PAT" | gh auth login --hostname "$GH_HOST" --with-token
+          gh auth status --hostname "$GH_HOST"
+          gh auth status
+
+      - name: Run validation (2_validation.sh)
+        shell: bash
+        working-directory: ${{ runner.temp }}/bbs2gh-validate
+        env:
+          GH_TOKEN: ''
+          BBS_BASE_URL: ${{ env.BBS_BASE_URL }}
+          BBS_PAT: ${{ secrets.BBS_PAT }}
+          BBS_AUTH_TYPE: ${{ vars.BBS_AUTH_TYPE }}
+          BBS_USERNAME: ${{ vars.BBS_USERNAME }}
+          BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
+          BBS_DISABLE_SSL_VERIFY: ${{ vars.BBS_DISABLE_SSL_VERIFY }}
+          COMMIT_CHECK: ${{ vars.COMMIT_CHECK }}
+          FAIL_ON_VALIDATION_FAILURES: ${{ vars.FAIL_ON_VALIDATION_FAILURES }}
+          STEP_FILTER_CSV_FILTERED_CSV: ${{ steps.filter-csv.outputs.filtered_csv }}
+        run: |
+          set -euo pipefail
+          export GH_CONFIG_DIR="$RUNNER_TEMP/gh-dr"
+          chmod +x "$GITHUB_WORKSPACE"/scripts/bash/*.sh || true
+
+          "$GITHUB_WORKSPACE"/scripts/bash/2_validation.sh \
+            -c "${STEP_FILTER_CSV_FILTERED_CSV}" \
+            -b "${BBS_BASE_URL}"
+
+      - name: Write validation step summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          md=$(ls -1t "${RUNNER_TEMP}/bbs2gh-validate"/validation-summary-*.md 2>/dev/null | head -n 1 || true)
+          csv=$(ls -1t "${RUNNER_TEMP}/bbs2gh-validate"/validation-summary-*.csv 2>/dev/null | head -n 1 || true)
+
+          {
+            echo "**🔍 Validation Summary**"
+            echo
+            if [[ -z "$csv" || ! -f "$csv" ]]; then
+              echo "⚠️ No validation summary CSV found."
+            else
+              total=$(awk -F',' 'NR>1 {c++} END{print c+0}' "$csv")
+              passed=$(awk -F',' 'NR>1 && $7=="true" && $8=="true" && $9=="true" {c++} END{print c+0}' "$csv")
+              failed=$(( total - passed ))
+              echo "- **Total repos validated**: $total"
+              echo "- **Fully matching**: ✅ $passed"
+              echo "- **With discrepancies**: $( [[ "$failed" -gt 0 ]] && echo \"❌ $failed\" || echo \"0\" )"
+              echo
+            fi
+            if [[ -n "$md" && -f "$md" ]]; then
+              echo "**Repo-wise Results**"
+              echo
+              cat "$md"
+            fi
+          } > "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload validation outputs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: validation-results-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/bbs2gh-validate/validation-log-*.txt
+            ${{ runner.temp }}/bbs2gh-validate/validation-summary-*.csv
+            ${{ runner.temp }}/bbs2gh-validate/validation-summary-*.md
+          retention-days: 30
+          if-no-files-found: warn
+
+  gitlfs:
+    name: Git LFS / large files
+    permissions:
+      contents: read
+      actions: read
+    needs: [scan, migrate]
+    if: ${{ always()
+      && (inputs.detect_lfs_repos == 'true' || inputs.migrate_lfs_repos == 'true' || inputs.migrate_large_file_repos == 'true')
+      && needs.scan.result == 'success'
+      && (needs.migrate.result == 'success' || (needs.migrate.result == 'skipped' && inputs.run_migration == 'false')) }}
+    uses: ./.github/workflows/bbs2gh-gitlfs.yml
+    with:
+      environment: ${{ inputs.environment }}
+      approval_environment: ${{ inputs.approval_environment }}
+      runner_label: ${{ inputs.runner_label }}
+      lfs_max_concurrent: ${{ inputs.lfs_max_concurrent }}
+      migrate_lfs_objects: ${{ inputs.migrate_lfs_repos == 'true' && needs.scan.outputs.lfs_repos != '0' }}
+      migrate_large_files: ${{ inputs.migrate_large_file_repos == 'true' && needs.scan.outputs.large_file_repos != '0' }}
+      large_file_threshold_mb: ${{ inputs.large_file_threshold_mb }}
+      large_file_convert_above_mb: ${{ inputs.large_file_convert_above_mb }}
+    secrets: inherit

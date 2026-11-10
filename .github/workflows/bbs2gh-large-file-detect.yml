@@ -1,0 +1,146 @@
+name: bbs2gh-large-file-detect
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub Environment holding secrets & variables"
+        required: true
+        type: string
+      runner_label:
+        description: "Runner label, or a JSON array of labels"
+        required: false
+        default: ubuntu-24.04
+        type: string
+      large_file_threshold_mb:
+        description: "A repo is a large-file repo if any file in its history is at least this size (MB)"
+        required: false
+        default: '400'
+        type: string
+      migrate_large_file_repos:
+        description: "Whether the caller will migrate the repos found (summary text only; the repos are skipped by the main migration either way)"
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      large_file_repos:
+        description: "Number of large-file repos found"
+        value: ${{ jobs.detect.outputs.large_file_repos }}
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Scan for large files
+    runs-on: ${{ startsWith(inputs.runner_label, '[') && fromJson(inputs.runner_label) || inputs.runner_label }}
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 50400
+    outputs:
+      large_file_repos: ${{ steps.large-list.outputs.count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Resolve BBS_BASE_URL (repo/environment variable)
+        shell: bash
+        env:
+          VAR_BBS_BASE_URL: ${{ vars.BBS_BASE_URL }}
+        run: |
+          set -euo pipefail
+          BBS_BASE_URL="${VAR_BBS_BASE_URL:-}"
+          if [[ -z "$BBS_BASE_URL" ]]; then
+            echo "::error::BBS_BASE_URL is not set. Set it as an Actions variable on the '${{ inputs.environment }}' environment (or repo-level) under Settings → Environments/Variables."
+            exit 1
+          fi
+          echo "BBS_BASE_URL=${BBS_BASE_URL}" >> "$GITHUB_ENV"
+
+      - name: Install jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+
+      - name: Build large-file repo list (large-file-repos.csv or scan)
+        id: large-list
+        shell: bash
+        env:
+          BBS_BASE_URL: ${{ env.BBS_BASE_URL }}
+          BBS_PAT: ${{ secrets.BBS_PAT }}
+          BBS_AUTH_TYPE: ${{ vars.BBS_AUTH_TYPE }}
+          BBS_USERNAME: ${{ vars.BBS_USERNAME }}
+          BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
+          BBS_DISABLE_SSL_VERIFY: ${{ vars.BBS_DISABLE_SSL_VERIFY }}
+          THRESHOLD_MB: ${{ inputs.large_file_threshold_mb }}
+        run: |
+          set -euo pipefail
+          count_rows() { tr -d '\r' < "$1" | awk 'NR>1 && $0 ~ /[^,"[:space:]]/ {c++} END{print c+0}'; }
+          supplied="$GITHUB_WORKSPACE/large-file-repos.csv"
+          chmod +x scripts/bash/*.sh || true
+
+          if [[ -f "$supplied" && "$(count_rows "$supplied")" -gt 0 ]]; then
+            source="large-file-repos.csv (customer-supplied, scan skipped)"
+            ./scripts/bash/4_large_file_migration.sh --list-only --csv "$supplied"
+          else
+            source="scanned repos.csv for files >= ${THRESHOLD_MB} MB"
+            ./scripts/bash/4_large_file_migration.sh --detect --csv "$GITHUB_WORKSPACE/repos.csv" --threshold-mb "$THRESHOLD_MB"
+          fi
+
+          list=$(ls -1t large-file-repos-*.csv | head -n 1)
+          count=$(count_rows "$list")
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "**🐘 Large-file repositories**"
+            echo
+            echo "- **Source**: $source"
+            echo "- **Large-file repos**: $count"
+            echo
+            if (( count > 0 )); then
+              echo "| Project Key | Repo | GitHub Org | GitHub Repo |"
+              echo "|-|-|-|-|"
+              awk -F',' 'NR>1 && $0 ~ /[^,"[:space:]]/ { for(i=1;i<=NF;i++) gsub(/"/,"",$i); printf("| `%s` | `%s` | `%s` | `%s` |\n", $1, $3, $4, $5) }' "$list"
+              echo
+              if [[ "${{ inputs.migrate_large_file_repos }}" == "true" ]]; then
+                echo "These repos are skipped by the Migration job. After a separate approval, the **Large-file Migration** job converts their large files to Git LFS (history is rewritten, commit SHAs change) and pushes them to GitHub."
+              else
+                echo "⚠️ \`migrate_large_file_repos=false\`: these repos are **skipped by the Migration job and not migrated**. Set \`migrate_large_file_repos=true\` to migrate them by converting their large files to Git LFS (history is rewritten)."
+              fi
+            fi
+            sizes=$(ls -1t repo-size-report-*.csv 2>/dev/null | head -n 1 || true)
+            if [[ -n "$sizes" ]]; then
+              echo
+              echo "**📏 Repository size report** (\`$sizes\` in the artifact; \`>=\` = at least, files at or above the threshold are not downloaded)"
+              echo
+              echo "| Repo | Clone MB | Commits | Branches / Tags | Files (total MB) | Largest file | > 100 MB | Largest commit MB | Warnings |"
+              echo "|-|-|-|-|-|-|-|-|-|"
+              awk -F',' 'NR>1 {
+                for(i=1;i<=NF;i++) gsub(/"/,"",$i);
+                if ($7 == "") { printf("| `%s/%s` | | | | | | | | %s |\n", $1, $2, $23); next }
+                printf("| `%s/%s` | %s | %s | %s / %s | %s (%s) | `%s` (%s MB) | %s | %s | %s |\n", $1, $2, $6, $7, $9, $10, $12, $13, $15, $14, $16, $18, ($22 == "" ? "✅" : "⚠️ " $22));
+              }' "$sizes"
+            fi
+            report=$(ls -1t large-file-report-*.csv 2>/dev/null | head -n 1 || true)
+            if [[ -n "$report" ]]; then
+              errors=$(awk -F',' 'NR>1 && $6=="error" {c++} END{print c+0}' "$report")
+              if (( errors > 0 )); then
+                echo
+                echo "⚠️ $errors repo(s) could not be scanned - see \`$report\` in the artifact."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload large-file repo list
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: large-file-repos-${{ github.run_id }}
+          path: |
+            large-file-repos-*.csv
+            large-file-report-*.csv
+            repo-size-report-*.csv
+          retention-days: 90
+          if-no-files-found: warn
