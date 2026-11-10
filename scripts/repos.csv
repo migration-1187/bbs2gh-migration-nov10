@@ -1,4 +1,3 @@
 project-key,project-name,repo,github_org,github_repo,gh_repo_visibility
-BBSMIG,bbs-migration-demo,Maven Hello World,aliakseim-10765507,calotracker_bbs-12a,private
-BBSMIG,bbs-migration-demo,solid-api,aliakseim-10765507,solid-api_bbs-12a,private
-BBSMIG,bbs-migration-demo,test-repo,aliakseim-10765507,test-repo-large,private
+BBSMIG,bbs-migration-demo,Maven Hello World,bbs-migration-test,calotracker_bbs-12a-1110,private
+BBSMIG,bbs-migration-demo,solid-api,bbs-migration-test,solid-api_bbs-12a-1110,private
